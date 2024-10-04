@@ -1,0 +1,207 @@
+- name: My first play
+  hosts: medal
+  remote_user: cc
+  tasks:
+    - name: Ping my hosts
+      ansible.builtin.ping:
+
+    - name: Print message
+      ansible.builtin.debug:
+        msg: Hello world!
+
+- name: Install conntrack
+  hosts: medal
+  become: true
+  remote_user: cc
+  tasks:
+    - name: Install aptitude
+      apt:
+        name: aptitude
+        state: latest
+        update_cache: true
+
+    - name: Install conntrack
+      apt:
+        name: conntrack
+        state: latest
+        update_cache: true
+
+- name: Install docker
+  hosts: medal
+  become: true
+  remote_user: cc
+  tasks:
+    - name: Install required system packages
+      apt:
+        name: "{{ packages }}"
+        state: latest
+        update_cache: true
+      vars:
+        packages:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg-agent
+          - software-properties-common
+          - python3-pip
+          - virtualenv
+          - python3-setuptools
+
+    - name: Add Docker apt repository key
+      ansible.builtin.get_url:
+        url: "{{ docker_repo_key_url }}"
+        dest: /etc/apt/trusted.gpg.d/docker.asc
+        mode: '0644'
+        force: true
+      vars:
+        docker_repo_key_url: https://download.docker.com/linux/ubuntu/gpg
+
+    - name: Add Docker apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/trusted.gpg.d/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Update apt and install docker-ce
+      apt:
+        name: "{{ packages }}"
+        state: latest
+        update_cache: true
+      vars:
+        packages:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+
+    - name: Install Docker Module for Python
+      pip:
+        name: docker
+    
+    - name: Add cc user to the Docker group
+      user:
+        name: cc
+        group: docker
+    
+    - name: Remove swapfile from /etc/fstab
+      mount:
+        name: "{{ item }}"
+        fstype: swap
+        state: absent
+      with_items:
+        - swap
+        - none
+
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+- name: Install Kubernetes
+  hosts: medal
+  become: true
+  remote_user: cc
+  vars:
+    kube_version: v1.30
+  tasks:
+    - name: Add Kubernetes apt repository key
+      ansible.builtin.get_url:
+        url: "{{ kube_repo_key_url }}"
+        dest: /etc/apt/trusted.gpg.d/kubernetes.asc
+        mode: '0644'
+        force: true
+      vars:
+        kube_repo_key_url: "https://pkgs.k8s.io/core:/stable:/{{ kube_version }}/deb/Release.key"
+
+    - name: Add Kubernetes apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/trusted.gpg.d/kubernetes.asc] https://pkgs.k8s.io/core:/stable:/{{ kube_version }}/deb/ /"
+        state: present
+
+    - name: Install Kubernetes binaries
+      apt:
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+          - kubelet
+          - kubeadm
+          - kubectl
+
+    - name: Configure node ip
+      lineinfile:
+        path: /etc/default/kubelet
+        line: KUBELET_EXTRA_ARGS=--node-ip={{ ansible_default_ipv4.address }}
+
+    - name: Restart kubelet
+      service:
+        name: kubelet
+        daemon_reload: yes
+        state: restarted
+
+    - name: Remove "disabled_plugins" directive in /etc/containerd/config.toml
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: '^.*(disabled_plugins.*)'
+        replace: '#\1'
+
+    - name: Restart containerd
+      service:
+        name: containerd
+        daemon_reload: yes
+        state: restarted
+
+    # TODO: This is fine for now, since this playbook is meant to be run on
+    #       raspberry pis, which all have this file. On x86 this correctly
+    #       doesn't run.
+    #
+    #       This needs to be tested on actual raspberry pis, and perhaps
+    #       checked to make sure that the test in the "when" clause is
+    #       run on each machine and not just the main node.
+    - name: (If on arm64) Add cgroup options to kernel command line
+      when: ansible_architecture == "aarch64" and "'/boot/firmware/cmdline.txt' is file"
+      ansible.builtin.lineinfile:
+        path: /boot/firmware/cmdline.txt
+        line: cgroup_enable=cpu cgroup_enable=memory
+
+- name: Initialize Kubernetes control plane on the main node
+  hosts: master
+  remote_user: cc
+  become: true
+  tasks:
+    - name: Run kubeadm init
+      command: kubeadm init
+
+    - name: Check that .kube directory exists
+      stat:
+        path: /home/cc/.kube
+      register: kube_dir
+
+    - name: Create .kube directory and copy kube config file if it doesn't exist
+      shell: "{{ item }}"
+      loop:
+        - mkdir -p /home/cc/.kube
+        - cp /etc/kubernetes/admin.conf /home/cc/.kube/config
+        - chown cc:cc -R /home/cc/.kube
+      when: not kube_dir.stat.exists
+ 
+- name: Generate join command and deploy worker nodes
+  hosts: medal
+  gather_facts: false
+  remote_user: cc
+  become: true
+  tasks:
+    - name: Get join command from main node
+      shell: kubeadm token create --print-join-command
+      register: join_command_raw
+      when: "'master' in group_names"
+
+    - name: Set join command for worker nodes
+      set_fact:
+        join_command: "{{ join_command_raw.stdout_lines[0] }}"
+      when: "'master' in group_names"
+      
+    - name: Join worker nodes to cluster
+      shell: "{{ hostvars['medal-test01'].join_command }} --ignore-preflight-errors all >> node_joined.txt"
+      args:
+        chdir: /home/cc
+        creates: node_joined.txt
+      when: "'worker' in group_names"
